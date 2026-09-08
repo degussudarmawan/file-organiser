@@ -31,6 +31,15 @@ from types import SimpleNamespace
 _TEST_STATE = tempfile.mkdtemp(prefix="organiser-state-")
 os.environ["FILE_ORGANISER_STATE_DIR"] = _TEST_STATE
 
+# The allowlist has to be declared for the same reason, and it is not a test
+# convenience: every target in this suite is an mkdtemp folder, which the
+# built-in default (Downloads/Desktop/Documents) correctly refuses. Naming the
+# temp root here is the suite doing what any other caller must do. Resolved
+# because macOS hands out /var/folders paths that are symlinks to /private.
+os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = str(
+    Path(tempfile.gettempdir()).resolve()
+)
+
 from organiser import delegates, undo_log  # noqa: E402
 from organiser.categories import (  # noqa: E402
     FALLBACK_CATEGORY,
@@ -49,7 +58,13 @@ from organiser.delegates import (  # noqa: E402
     SchemeRequest,
 )
 from organiser.manager import FirstRunConfirmationRequired, Manager  # noqa: E402
-from organiser.paths import unique_destination  # noqa: E402
+from organiser.paths import (  # noqa: E402
+    RootPolicy,
+    UnsafePath,
+    root_policy,
+    unique_destination,
+    validate_target_dir,
+)
 from organiser.config import (  # noqa: E402
     DEFAULT_MODELS,
     ConfigError,
@@ -923,6 +938,174 @@ class ConfigTests(unittest.TestCase):
         # a secret. Guard against anyone "helpfully" adding one later.
         self._write({"provider": "openai", "classifier": {"model": "m"}})
         self.assertNotIn("api_key", load_settings().to_dict())
+
+
+class AllowlistTests(unittest.TestCase):
+    """The reachability boundary: which folders exist at all, as far as this
+    tool is concerned.
+
+    Most of these are escape attempts rather than happy paths. A boundary that
+    has only been tested with the folder it was meant to allow has not been
+    tested.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="organiser-roots-")).resolve()
+        self.allowed = self.tmp / "allowed"
+        self.allowed.mkdir()
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        self.policy = RootPolicy((self.allowed,), "test")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_a_folder_inside_an_allowed_root_is_permitted(self):
+        inner = self.allowed / "papers"
+        inner.mkdir()
+        self.assertEqual(validate_target_dir(str(inner), self.policy), inner)
+
+    def test_the_allowed_root_itself_is_permitted(self):
+        # Organising ~/Downloads directly is the main use of this tool; a
+        # boundary that only allows subfolders of a root would be useless.
+        self.assertEqual(validate_target_dir(str(self.allowed), self.policy), self.allowed)
+
+    def test_a_folder_outside_every_root_is_refused(self):
+        with self.assertRaises(UnsafePath):
+            validate_target_dir(str(self.outside), self.policy)
+
+    def test_a_sibling_sharing_a_name_prefix_is_refused(self):
+        """The string-prefix bug, which is the classic way this check is got
+        wrong: "/x/allowed-old" starts with "/x/allowed" as text but is a
+        different directory entirely."""
+        sibling = self.tmp / "allowed-old"
+        sibling.mkdir()
+        with self.assertRaises(UnsafePath) as ctx:
+            validate_target_dir(str(sibling), self.policy)
+        self.assertIn("outside", str(ctx.exception))
+
+    def test_a_symlink_out_of_an_allowed_root_is_refused(self):
+        """The obvious way out: a link that LIVES inside the boundary but
+        POINTS beyond it. Checking the path as typed would permit this;
+        checking the resolved path does not."""
+        escape = self.allowed / "escape"
+        escape.symlink_to(self.outside, target_is_directory=True)
+        self.assertTrue(escape.exists())  # the link really does resolve
+        with self.assertRaises(UnsafePath):
+            validate_target_dir(str(escape), self.policy)
+
+    def test_dot_dot_traversal_out_of_an_allowed_root_is_refused(self):
+        with self.assertRaises(UnsafePath):
+            validate_target_dir(str(self.allowed / ".." / "outside"), self.policy)
+
+    def test_dot_dot_that_stays_inside_is_permitted(self):
+        """Traversal is not itself the crime — leaving is. This one comes back
+        in, so it must be allowed, or the check is just banning a character."""
+        inner = self.allowed / "papers"
+        inner.mkdir()
+        self.assertEqual(
+            validate_target_dir(str(inner / ".." / "papers"), self.policy), inner
+        )
+
+    def test_an_empty_allowlist_reaches_nothing(self):
+        empty = RootPolicy((), "test")
+        with self.assertRaises(UnsafePath):
+            validate_target_dir(str(self.allowed), empty)
+
+    def test_home_is_refused_even_when_it_is_allowlisted(self):
+        """Defence in depth: allowlisting $HOME is almost certainly a mistake,
+        and it is not the kind of mistake this tool should honour."""
+        home_policy = RootPolicy((Path.home(),), "test")
+        with self.assertRaises(UnsafePath) as ctx:
+            validate_target_dir(str(Path.home()), home_policy)
+        self.assertIn("too broad", str(ctx.exception))
+
+    def test_a_folder_under_an_allowlisted_home_still_works(self):
+        """...but the rule above must not make $HOME useless as a root."""
+        under = self.allowed / "papers"
+        under.mkdir()
+        self.assertEqual(
+            validate_target_dir(str(under), RootPolicy((self.allowed,), "test")), under
+        )
+
+    def test_the_env_var_wins_over_the_config_file(self):
+        original = os.environ.get("FILE_ORGANISER_ALLOWED_ROOTS")
+        os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = str(self.allowed)
+        try:
+            policy = root_policy()
+            self.assertEqual(policy.roots, (self.allowed,))
+            self.assertIn("FILE_ORGANISER_ALLOWED_ROOTS", policy.source)
+        finally:
+            if original is None:
+                del os.environ["FILE_ORGANISER_ALLOWED_ROOTS"]
+            else:
+                os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = original
+
+    def test_multiple_roots_are_each_honoured(self):
+        second = self.tmp / "second"
+        second.mkdir()
+        original = os.environ.get("FILE_ORGANISER_ALLOWED_ROOTS")
+        os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = os.pathsep.join(
+            [str(self.allowed), str(second)]
+        )
+        try:
+            policy = root_policy()
+            self.assertEqual(set(policy.roots), {self.allowed, second})
+            self.assertEqual(validate_target_dir(str(second), policy), second)
+            with self.assertRaises(UnsafePath):
+                validate_target_dir(str(self.outside), policy)
+        finally:
+            if original is None:
+                del os.environ["FILE_ORGANISER_ALLOWED_ROOTS"]
+            else:
+                os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = original
+
+    def test_the_default_policy_is_used_when_no_policy_is_passed(self):
+        """The fail-open check. A caller that forgets the policy argument must
+        get the configured boundary, never "anything goes"."""
+        with self.assertRaises(UnsafePath):
+            validate_target_dir(str(Path("/")))
+
+    def test_the_boundary_explains_itself(self):
+        policy = RootPolicy((self.allowed,), "built-in default")
+        self.assertIn(str(self.allowed), policy.describe())
+        self.assertIn("built-in default", policy.describe())
+        with self.assertRaises(UnsafePath) as ctx:
+            validate_target_dir(str(self.outside), policy)
+        # The refusal has to say what IS allowed, or it is unactionable.
+        self.assertIn(str(self.allowed), str(ctx.exception))
+
+
+class ManagerRespectsTheAllowlistTests(unittest.TestCase):
+    """The boundary has to hold at the manager, not only in the helper — the
+    manager is the only thing that moves files."""
+
+    def setUp(self):
+        register_stubs()
+        self.tmp = Path(tempfile.mkdtemp(prefix="organiser-mgr-roots-")).resolve()
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        (self.outside / "photo.jpg").write_text("x")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_scanning_outside_the_allowlist_is_refused(self):
+        original = os.environ["FILE_ORGANISER_ALLOWED_ROOTS"]
+        os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = str(self.tmp / "elsewhere")
+        try:
+            manager = stub_manager()
+            with self.assertRaises(UnsafePath):
+                manager.scan(str(self.outside))
+        finally:
+            os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = original
+
+    def test_nothing_was_touched_when_the_scan_was_refused(self):
+        original = os.environ["FILE_ORGANISER_ALLOWED_ROOTS"]
+        os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = str(self.tmp / "elsewhere")
+        try:
+            manager = stub_manager()
+            with self.assertRaises(UnsafePath):
+                manager.scan(str(self.outside))
+        finally:
+            os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = original
+        self.assertEqual([p.name for p in self.outside.iterdir()], ["photo.jpg"])
 
 
 if __name__ == "__main__":
