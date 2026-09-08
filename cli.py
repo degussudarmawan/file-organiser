@@ -28,7 +28,7 @@ from organiser.config import (
 )
 from organiser.delegates import get as get_delegate
 from organiser.manager import FirstRunConfirmationRequired, Manager
-from organiser.paths import UnsafePath, unique_destination
+from organiser.paths import ROOTS_ENV, UnsafePath, root_policy, unique_destination
 from organiser.plan import Plan, PlanItem
 from organiser.undo_log import read_log, record_move, undo_log_path
 
@@ -571,6 +571,25 @@ def print_config(settings, statuses: dict[str, tuple[bool, str]]) -> None:
     out(STYLE.dim("  The API key is never read or stored by this tool's config —"))
     out(STYLE.dim("  it stays in the environment, so the state dir holds no secret."))
 
+    # The reachability boundary belongs in the command people run when
+    # something is refused. A boundary you have to read the source to discover
+    # is one that gets argued with instead of configured.
+    heading("REACHABLE FOLDERS")
+    try:
+        policy = root_policy()
+    except UnsafePath as exc:
+        out(f"  {STYLE.yellow('unreadable')}  {exc}")
+    else:
+        if not policy.roots:
+            out(f"  {STYLE.yellow('nothing is reachable')}  {STYLE.dim(f'({policy.source})')}")
+        else:
+            for root in policy.roots:
+                out(f"  {STYLE.cyan(_tilde(root))}")
+            out(f"  {STYLE.dim(f'source: {policy.source}')}")
+        out()
+        out(STYLE.dim("  Folders outside these are refused before anything is read."))
+        out(STYLE.dim(f"  Widen or narrow with {ROOTS_ENV}, or \"allowed_roots\" in the config file."))
+
     heading("AGENT STATUS")
     status_width = len("unavailable")
     for agent in CONFIG_AGENTS:
@@ -1000,6 +1019,14 @@ def cmd_config(args: argparse.Namespace) -> int:
             name: {"available": ok, "detail": detail}
             for name, (ok, detail) in statuses.items()
         }
+        try:
+            policy = root_policy()
+            payload["allowed_roots"] = {
+                "roots": [str(r) for r in policy.roots],
+                "source": policy.source,
+            }
+        except UnsafePath as exc:
+            payload["allowed_roots"] = {"roots": [], "source": None, "error": str(exc)}
         out(json.dumps(payload, indent=2))
         return 0
 
