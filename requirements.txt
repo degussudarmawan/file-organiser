@@ -13,6 +13,16 @@
 # The local web UI's HTTP layer (organiser/server.py, run.py).
 flask>=3.1
 
+# The MCP server (organiser/mcp_server.py), which exposes the same manager to
+# a host LLM over stdio. FastMCP generates the schema, validation and
+# transport from ordinary typed Python functions, so the tool definitions stay
+# readable as code rather than as JSON Schema.
+#
+# Note if you ever swap this for the official SDK directly: `pip install mcp`
+# now resolves to the 2.x line, so pin `mcp>=1.28,<2` if you want the older
+# one. FastMCP brings its own compatible version, so nothing to do here.
+fastmcp>=4
+
 # Response schemas for both delegate agents, and what every provider validates
 # model output against. Listed explicitly now rather than left to arrive as an
 # SDK's transitive dependency: organiser/classifier.py and organiser/scheme.py
