@@ -1,0 +1,41 @@
+# Setup: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# Installing this file gets you everything, which is the convenient default.
+# But only two of these are actually required: the provider SDKs are
+# optional-per-provider. `organiser/providers/get_provider()` imports lazily
+# and per provider, so a missing SDK is only ever an error for the provider you
+# selected — not for the one you don't use. `cli.py config` tells you which one
+# is selected and whether it can run.
+
+
+# --- required ----------------------------------------------------------------
+
+# The local web UI's HTTP layer (organiser/server.py, run.py).
+flask>=3.1
+
+# Response schemas for both delegate agents, and what every provider validates
+# model output against. Listed explicitly now rather than left to arrive as an
+# SDK's transitive dependency: organiser/classifier.py and organiser/scheme.py
+# import it directly, and which SDK you install must not decide whether the
+# agents can be imported at all.
+pydantic>=2
+
+
+# --- optional: install the one your provider needs ---------------------------
+#
+#   provider "anthropic"    -> anthropic
+#   provider "openai"       -> openai
+#   provider "compatible"   -> openai  (the same SDK pointed at a base_url:
+#                                       Ollama, LM Studio, vLLM, OpenRouter)
+#
+# Pick with FILE_ORGANISER_PROVIDER or "provider" in
+# ~/.file-organiser-agent/config.json. Uninstalling the other one is safe.
+
+# provider "anthropic" — the built-in default provider.
+anthropic>=0.123
+
+# providers "openai" and "compatible". The version floor is the version present
+# here, whose `responses.parse(..., text_format=...)` signature the provider was
+# written against; no request has ever been made with it (no credentials on this
+# machine), so read it as "known to have the right API surface", not "tested".
+openai>=3.3

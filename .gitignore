@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Nothing else needs listing here: the app's state directory lives OUTSIDE the
+# repo, at ~/.file-organiser-agent/ (see organiser/paths.py). Saved plans
+# (~/.file-organiser-agent/plans/) and the undo log
+# (~/.file-organiser-agent/undo-log.jsonl) therefore can never be committed by
+# accident — they are records of one machine's real files, not source.
+config.json
