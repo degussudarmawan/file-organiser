@@ -30,7 +30,13 @@ from organiser.delegates import get as get_delegate
 from organiser.manager import FirstRunConfirmationRequired, Manager
 from organiser.paths import ROOTS_ENV, UnsafePath, root_policy, unique_destination
 from organiser.plan import Plan, PlanItem
-from organiser.undo_log import read_log, record_move, undo_log_path
+from organiser.undo_log import (
+    execute_undo,
+    plan_undo,
+    read_log,
+    record_move,
+    undo_log_path,
+)
 
 # Importing the two delegate modules is what registers them with the delegate
 # registry: the classifier (per-file) and the scheme proposer (per-run
@@ -877,41 +883,16 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 def cmd_undo(args: argparse.Namespace) -> int:
-    entries = read_log(limit=UNDO_LOG_SCAN_LIMIT, plan_id=args.plan_id)
-    if not entries:
+    if not read_log(limit=UNDO_LOG_SCAN_LIMIT, plan_id=args.plan_id):
         err(f"no logged moves for plan {args.plan_id}")
         return 1
 
-    # read_log is newest first, which is the right order to unwind in: a later
-    # move can only have depended on an earlier one, never the other way round.
-    reversals: list[tuple[dict, Path, Path]] = []
-    blocked: list[tuple[dict, str]] = []
-    reserved: set[Path] = set()
-
-    for entry in entries:
-        raw_destination = str(entry.get("destination") or "")
-        raw_source = str(entry.get("source") or "")
-
-        if not raw_destination or not raw_source:
-            blocked.append((entry, "log entry is missing a source or destination"))
-            continue
-
-        destination = Path(raw_destination)
-        source = Path(raw_source)
-
-        if not destination.exists():
-            blocked.append((entry, f"{destination} no longer exists"))
-            continue
-        if source.exists():
-            blocked.append((entry, f"{source} is occupied again — refusing to overwrite"))
-            continue
-
-        # Two logged moves can name the same original path (a file moved,
-        # restored by hand, then moved again). Never let the second one land on
-        # top of the first.
-        final = unique_destination(source, reserved)
-        reserved.add(final)
-        reversals.append((entry, destination, final))
+    # The planning and the moving both live in undo_log now, so the MCP server
+    # reverses a plan through exactly the same code this does. What's left here
+    # is presentation and the confirmation gate.
+    undo = plan_undo(args.plan_id)
+    reversals = [(r.entry, r.source, r.destination) for r in undo.reversals]
+    blocked = undo.blocked
 
     heading(f"UNDO plan {args.plan_id}")
     out(f"  {len(reversals)} moves to reverse, {len(blocked)} skipped")
@@ -947,38 +928,20 @@ def cmd_undo(args: argparse.Namespace) -> int:
         out(STYLE.dim("Not confirmed. Nothing was moved."))
         return 1
 
-    reversed_count = 0
-    failures: list[tuple[Path, str]] = []
-    for entry, destination, final in reversals:
-        try:
-            final.parent.mkdir(parents=True, exist_ok=True)
-            # `final` was proven free above, so this never clobbers anything.
-            shutil.move(str(destination), str(final))
-        except OSError as exc:
-            failures.append((destination, str(exc)))
-            continue
-
-        reversed_count += 1
-        # The reversal is itself a move, so it goes in the log too. Source and
-        # destination are swapped relative to the entry being undone.
-        record_move(
-            plan_id=f"undo:{args.plan_id}",
-            item_id=str(entry.get("item_id", "")),
-            source=str(destination),
-            destination=str(final),
-            category=str(entry.get("category", "")),
-            decided_by="undo",
-            confidence="n/a",
-        )
+    result = execute_undo(undo)
+    failures = result["failures"]
 
     heading("RESULT")
-    out(f"  {STYLE.green(str(reversed_count))} moves reversed, {len(blocked)} skipped")
+    out(
+        f"  {STYLE.green(str(result['reversed']))} moves reversed, "
+        f"{len(blocked)} skipped"
+    )
     if failures:
         out(f"  {STYLE.red(str(len(failures)))} failed:")
-        for path, reason in failures:
-            out(f"      {path}")
-            out(STYLE.dim(f"          {reason}"))
-    out(STYLE.dim(f"Reversals logged under plan id undo:{args.plan_id}"))
+        for failure in failures:
+            out(f"      {failure['file']}")
+            out(STYLE.dim(f"          {failure['error']}"))
+    out(STYLE.dim(f"Reversals logged under plan id {result['logged_under']}"))
     return 1 if failures else 0
 
 
