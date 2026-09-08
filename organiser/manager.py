@@ -305,6 +305,21 @@ class Manager:
                     entry, size, f"classifier errored on this file ({exc}); left in place"
                 )
             else:
+                if decision.category is None:
+                    # An explicit "I don't know". Distinct from the delegate
+                    # being broken, and it must not be turned into a guess: a
+                    # delegate declining to place a file is the system working,
+                    # so the file stays put and the delegate's own words say
+                    # why.
+                    items[entry.name] = self._left_alone(
+                        entry,
+                        size,
+                        decision.reason
+                        or f"{decision.decided_by or self._delegate_name} had no "
+                        "opinion; left in place",
+                    )
+                    continue
+
                 category = decision.category
                 confidence = decision.confidence
                 reason = decision.reason

@@ -74,10 +74,22 @@ class SchemeProposal:
 
 @dataclass(frozen=True)
 class DelegateDecision:
-    """What a delegate hands back. `category` must be one of the allowed
-    categories it was given; `confidence` is high/medium/low."""
+    """What a delegate hands back.
 
-    category: str
+    `category` must be one of the allowed categories it was given, or **None**
+    to mean "no opinion — leave this file where it is".
+
+    That None case matters. Before it existed, a delegate that was working
+    fine but simply unsure about one file had no way to say so: the only route
+    to "leave it alone" was raising, which the manager records as the delegate
+    having *errored*. So the honest answer was indistinguishable from a fault,
+    and the alternative was to name a category anyway — which is the one thing
+    this system is not supposed to do.
+
+    `confidence` is high/medium/low, or n/a alongside a None category.
+    """
+
+    category: str | None
     confidence: str
     reason: str
     decided_by: str
