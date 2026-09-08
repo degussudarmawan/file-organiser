@@ -16,6 +16,13 @@ every single thing it did.
 > What *has* been run end to end: the rule pass, the no-credential path,
 > provider and model resolution in every combination (`cli.py config`), and
 > scan / apply / log / undo on real files.
+>
+> **The MCP server is the exception, and is fully exercised.** When judgement
+> comes from the host model (`propose_plan(path, assignments=...)`) no
+> provider is involved at all, so that whole path — scan, propose, apply,
+> undo — has been driven over a real MCP connection, including as a launched
+> subprocess over stdio, the way a client runs it. See
+> [The MCP server](#10-the-mcp-server).
 
 ## 1. What it is
 
@@ -73,7 +80,7 @@ This split is also the concrete proof of the extensibility claim. The manager
 was written for one delegate; adding the proposer needed **no change to the
 manager's control flow** — a second protocol in `organiser/delegates.py`, a new
 module that calls `register()`, and the manager resolves it by name like the
-first. That is what the registry was for. See [Extending it](#11-extending-it).
+first. That is what the registry was for. See [Extending it](#12-extending-it).
 
 The division of labour across all three passes is deliberate: rules are fast,
 free, and deterministic, so they go first and handle the overwhelming majority.
@@ -89,8 +96,9 @@ grouping, at one model call per file. See
 ## 2. Architecture
 
 ```
-run.py                  entry point: starts the local server
+run.py                  entry point: starts the local web server
 cli.py                  entry point: the command-line front end
+serve_mcp.py            entry point: the MCP server, for a host LLM
 organiser/
   manager.py            orchestrator. Owns scan/apply. THE ONLY MODULE THAT
                         TOUCHES THE FILESYSTEM.
@@ -129,13 +137,18 @@ organiser/
                         is proposed per run.
   plan.py               the Plan/PlanItem model and the on-disk PlanStore.
                         A plan is inert: building one moves nothing.
-  paths.py              every path-safety rule in one auditable place:
-                        target validation, top-level-only, non-overwriting
-                        destination naming.
-  undo_log.py           the append-only move log and the first-run
-                        acknowledgement ledger.
+  paths.py              every path-safety rule in one auditable place: the
+                        allowlist of reachable folders, target validation,
+                        top-level-only, non-overwriting destination naming.
+  undo_log.py           the append-only move log — the audit trail — plus the
+                        planner and executor that reverse a plan, and the
+                        first-run acknowledgement ledger.
   server.py             a thin JSON shell around the manager. No organising
                         logic of its own.
+  mcp_server.py         the same manager exposed to a host LLM over MCP.
+                        Also holds the host-model delegate: judgement that
+                        arrives from the other end of the connection instead
+                        of from a provider API.
 static/                 the single-page web UI.
 ```
 
@@ -154,12 +167,41 @@ One scan is three passes, in increasing order of cost:
    plan.py             an inert Plan. Nothing has moved.
 ```
 
-**The invariant:** the UI holds no organising logic and has no filesystem
-access. It talks to the manager exclusively through the HTTP endpoints
-(`POST /scan`, `POST /apply`, `GET /plan/<id>`, `GET /plans`, `GET /log`,
-`GET /health`). Every safety rule therefore lives in one place and cannot be
-bypassed by a second front end — which is why the CLI and the browser behave
-identically.
+**The invariant:** no front end holds organising logic or touches the
+filesystem. The browser talks to the manager through HTTP endpoints (`POST
+/scan`, `POST /apply`, `GET /plan/<id>`, `GET /plans`, `GET /log`,
+`GET /health`); the CLI and the MCP server call the manager directly. Every
+safety rule therefore lives in one place and cannot be bypassed by adding a
+front end — which is why a person in a terminal, a browser, and a language
+model all get the same answer to "may I touch this folder?".
+
+That claim is worth checking rather than believing. In the ~4,400 lines of
+application code, these are **all** the operations that can move a user's
+file:
+
+```
+organiser/manager.py:511    shutil.move   (applying a plan)
+organiser/undo_log.py:200   shutil.move   (reversing one)
+```
+
+...and these are all the ones that can destroy one:
+
+```
+(there are none)
+```
+
+No `rmtree`, no `unlink`, no `remove`, no `copy`. Check it yourself:
+
+```bash
+grep -rn --include='*.py' -E "shutil\.(move|copy|rmtree)|os\.(rename|remove|unlink)" \
+    organiser/ cli.py run.py serve_mcp.py
+```
+
+The path list is not there to flatter the result. Run it across the repo and
+you will also get a dozen `shutil.rmtree` hits in `tests/` — those are tests
+deleting their own `mkdtemp` sandboxes in `tearDown`, which is what a test
+suite is supposed to do and is not code any user's folder can reach. The
+claim is about what ships, so the check is scoped to what ships.
 
 ### The layering, plainly
 
@@ -849,7 +891,132 @@ something. The reversals are themselves appended to the log under
 `undo:<plan_id>`, so the history stays honest: the log records what happened,
 not what was intended.
 
-## 10. Safety guarantees
+## 10. The MCP server
+
+The third front end. Same manager, same guarantees, but the caller is a
+language model rather than a person.
+
+### Why this exists
+
+An LLM is a text-in, text-out function: it cannot read your files. MCP is the
+protocol that standardises how an application hands it that ability — one
+server, usable by any MCP-speaking client, instead of bespoke glue per model
+per tool.
+
+The part worth being careful about is that **an MCP server runs on your
+machine, as you, with your permissions**. Nothing in the protocol constrains
+what a tool does; `shutil.rmtree` is a perfectly valid MCP tool. So the
+envelope around the capability is not a nice-to-have, it is the difference
+between a useful integration and handing a model your home directory. That
+envelope is [§11](#11-safety-guarantees), and it is the same one the CLI and
+the browser get.
+
+### Run it
+
+```bash
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python serve_mcp.py
+```
+
+It speaks JSON-RPC on stdout and expects to be launched by a client, so
+running it by hand just sits there — that is correct.
+
+`serve_mcp.py` is a one-line entry point that exists for a dull but real
+reason: `organiser/mcp_server.py` uses relative imports, so loading it *as a
+file path* fails with "attempted relative import with no known parent
+package", and most MCP tooling wants a file path. Use `serve_mcp.py` with
+anything that takes a path, or `-m organiser.mcp_server` with anything that
+takes a module. Both are equivalent.
+
+For Claude Desktop, add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "file-organiser": {
+      "command": "/absolute/path/to/file-organiser-agent/.venv/bin/python",
+      "args": ["serve_mcp.py"],
+      "cwd": "/absolute/path/to/file-organiser-agent",
+      "env": {
+        "FILE_ORGANISER_ALLOWED_ROOTS": "/Users/you/Downloads"
+      }
+    }
+  }
+}
+```
+
+Setting `FILE_ORGANISER_ALLOWED_ROOTS` there is the recommended shape: the
+boundary is declared in the client config, next to the decision to connect the
+server at all, rather than buried in a file somewhere else. Narrow it to the
+one folder you actually want reachable.
+
+To poke at it without a client:
+
+```bash
+.venv/bin/fastmcp list serve_mcp.py               # what tools it exposes
+.venv/bin/fastmcp dev inspector serve_mcp.py      # the MCP Inspector
+```
+
+### The tools
+
+| tool | read-only | what it does |
+|---|---|---|
+| `list_allowed_roots()` | yes | the boundary, so the model can ask instead of guess |
+| `scan_directory(path)` | yes | inventory: what the rules placed, what needs judgement |
+| `propose_plan(path, assignments?)` | yes | build a plan; returns a `plan_id`. Moves nothing |
+| `apply_plan(plan_id, confirm?)` | **no** | executes; writes the audit trail |
+| `undo_plan(plan_id?, confirm?)` | **no** | reverses; dry run unless `confirm=True` |
+
+Each is declared with MCP annotations (`read_only_hint`, `destructive_hint`),
+so a client knows which calls are safe to make without asking. None of them is
+marked destructive, because none of them is — and marking them so anyway would
+just teach people to ignore the flag.
+
+### Where the judgement comes from
+
+This is the reason the delegate seam exists, and the more interesting half of
+the design:
+
+- **`propose_plan(path)`** uses the configured provider agents. Needs an API
+  key, costs a call per file. Identical to what the CLI does.
+- **`propose_plan(path, assignments={...})`** takes the **host model's**
+  decisions instead. The model on the other end has already read the file list
+  from `scan_directory`, so paying a second model to read it again is cost and
+  latency for nothing — and it puts a model in the loop that the person
+  watching cannot see.
+
+The second is the better shape for MCP, and it needed **no change to
+`manager.py`**. The host's decisions are registered as an ordinary `Delegate`;
+the manager asks "what category for this file?" and cannot tell that the
+answer came down a stdio pipe rather than from an API.
+
+Two consequences worth knowing:
+
+- **Assignments are authoritative by default.** The rule table runs *before*
+  any delegate, so leaving it on would mean a file the rules recognise never
+  reaches your decision — ask for `notes.txt -> Meetings` and quietly get
+  `Documents/notes.txt`. So `use_rules` defaults to off when you pass
+  assignments. Turn it on deliberately if you want the rules to handle
+  everything you did not name; anything of yours they overrule comes back in
+  `overruled_by_rules` rather than vanishing.
+- **Files you do not assign stay where they are.** Not filed under `Other/` —
+  left alone. Declining to decide is a real answer here.
+
+### What this server does and does not guarantee
+
+Worth stating plainly, because it is easy to imply more than is true.
+
+**It guarantees:** nothing outside the allowlist is reachable; no file is ever
+deleted or overwritten; proposing and applying are separate calls, so no
+single call can both decide and move; the first apply to a folder needs an
+explicit `confirm`; every move is logged and reversible.
+
+**It does not guarantee** a human saw the call. The approval prompt belongs to
+the MCP **client**, not to this server. If a client auto-approves tool calls,
+this server will do as it is asked — within the envelope above, which is
+exactly why the envelope is where the effort went.
+
+## 11. Safety guarantees
 
 - **It never deletes.** The only filesystem operation in the codebase is a
   move. There is no `unlink`, no `rmtree`, no "clean up".
@@ -868,13 +1035,38 @@ not what was intended.
 - **Every move is logged** with its source, destination, plan, deciding agent
   and confidence — enough to reverse it by hand if you never touch this tool
   again.
-- **Absurd targets are refused.** `/` and `$HOME` itself are rejected as too
-  broad (`paths.validate_target_dir`).
+- **Only allowlisted folders are reachable at all.** Not a denylist of bad
+  targets — a list of permitted roots, and everything else is refused before
+  anything is read (`paths.root_policy`). Defaults to `~/Downloads`,
+  `~/Desktop` and `~/Documents`; override with
+  `FILE_ORGANISER_ALLOWED_ROOTS` or `"allowed_roots"` in the config file.
+
+  The distinction matters more than it looks. "Refuse the obviously
+  catastrophic" requires you to have thought of every catastrophe in advance;
+  a default-deny list requires you to have thought of the three folders you
+  actually use. Containment is a resolved-path comparison, never a string
+  prefix — `~/Downloads-old` is not inside `~/Downloads` — and the *resolved*
+  path is what gets checked, so a symlink sitting inside a permitted root but
+  pointing outside it does not escape.
+
+  A config file that cannot be parsed makes **nothing** reachable rather than
+  falling back to the default. If you meant a narrower list than the default,
+  quietly widening it is the exact failure this is here to prevent.
+
+- **Absurd targets are refused even if allowlisted.** `/` and `$HOME` itself
+  stay rejected as too broad. Defence in depth: allowlisting your whole home
+  directory is almost certainly a mistake, and not one worth honouring.
 - **An unavailable agent means "leave it alone", never "guess".** No API key,
   no network, a model error, a scheme that could not be proposed, or a category
   outside the allowed list all resolve to "the rules had no opinion and the
   delegates could not help, so this file stays where it is." The manager never
   invents a vocabulary of its own when the proposer fails.
+
+- **An agent that is working but unsure can say so.** A delegate may return
+  `category=None`, meaning "no opinion — leave this one". Without it, the only
+  way to leave a file alone was to raise, which is recorded as the delegate
+  having *errored* — so an honest "I don't know" looked identical to a fault,
+  and the tempting alternative was to name a category anyway.
 - **Model-produced category names are sanitised before they are paths.**
   Separators, traversal, control characters and reserved names cannot survive
   `categories.normalise_category()`, names are capped at 40 characters, and the
@@ -884,8 +1076,39 @@ not what was intended.
   filename, not a path. Moving is the manager's job alone. This holds for the
   scheme proposer too: it sees a list of `FileSummary` objects, which carry a
   filename, a snippet and a size, and nothing else.
+- **File contents are not sent anywhere by default over MCP.**
+  `scan_directory` returns filenames and sizes; snippets require
+  `include_snippets=True`. The filename is metadata, the contents are the
+  document, and shipping every document to a model should be a decision
+  somebody makes rather than a default they discover afterwards.
 
-## 11. Extending it
+### Why these constraints, and not just "be careful"
+
+Every rule above answers the same question: *what is the worst thing that
+happens when this is wrong?* Not "when it works" — when the model
+misunderstands, when a filename is adversarial, when someone points it at the
+wrong folder in a hurry.
+
+That framing is the reason this is a file organiser and not, say, a file
+manager. Deleting was never a feature that got cut for time; it is a
+capability the tool deliberately does not have, so that no bug, prompt
+injection or misread instruction can reach it. The blast radius is bounded by
+what the code *can* do, not by what it currently *chooses* to do — and only
+the first of those survives contact with a model.
+
+The same envelope transfers directly to records that actually matter. Point it
+at a folder of client documents and the shape is unchanged: allowlist the one
+directory, never delete, never overwrite, propose before applying, log every
+mutation with who decided it and why, and keep the whole thing reversible. The
+audit trail is not a debugging aid in that setting — it is the answer to "what
+touched this file, when, and on whose decision?", which is a question a
+compliance regime asks and a `shutil.move` sprinkled through a script cannot
+answer.
+
+This tool has no domain knowledge about any of that, and claiming otherwise
+would be silly. What transfers is the architecture, not the categories.
+
+## 12. Extending it
 
 `organiser/delegates.py` defines **two** protocols, and which one you implement
 depends on the shape of the question your agent answers:
@@ -898,10 +1121,36 @@ depends on the shape of the question your agent answers:
 Both are `@runtime_checkable` Protocols with an `available() -> (bool, str)`
 probe, and both register into the same registry by name.
 
-The scheme proposer is the worked example of adding an agent: it went in as a
-new protocol plus a new module, and `manager.py`'s control flow did not change
-to accommodate it — the manager resolves it by name (`Manager(scheme_name=...)`)
-exactly as it resolves the classifier.
+A `Delegate` has three things it can say, and the third matters:
+
+- **a category** from `request.allowed_categories` — file gets moved there;
+- **`DelegateUnavailable`** — "I cannot run at all" (no key, no network, model
+  error). The manager stops delegating for the rest of the run;
+- **`category=None`** — "I am working fine and I have no opinion about *this
+  one*." The file stays where it is, with your `reason` recorded against it.
+
+The third exists because without it, an honest "I don't know" had to be
+expressed by raising, which the manager records as the delegate having
+errored — indistinguishable from a fault, and the tempting alternative was to
+name a category anyway.
+
+There are two worked examples of adding an agent, and they are worth reading
+in order:
+
+**The scheme proposer** went in as a new protocol plus a new module, and
+`manager.py`'s control flow did not change to accommodate it — the manager
+resolves it by name (`Manager(scheme_name=...)`) exactly as it resolves the
+classifier.
+
+**The host-model delegate** (`_HostDelegate` in `organiser/mcp_server.py`) is
+the stranger one: it is a `Delegate` whose judgement is a dictionary handed in
+over an MCP connection. There is no model call inside it at all — the
+"reasoning" happened in the LLM at the other end of the pipe before
+`propose_plan` was ever invoked. The manager asks it "what category for this
+file?" and cannot tell the difference. That is roughly forty lines, and it is
+the strongest evidence that the seam is real rather than decorative: a
+completely different source of judgement, plugged in with no change to the
+component that consumes it.
 
 Adding a third agent takes one file and one function call. For a per-file
 agent, implement `Delegate`:
