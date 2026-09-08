@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Organiser</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="appbar">
+    <div class="appbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-text">
+          <strong>File Organiser</strong>
+          <span class="brand-sub">Two agents propose. You approve. Then it moves.</span>
+        </span>
+      </div>
+      <!-- filled from /health -->
+      <div id="health" class="health" aria-live="polite">
+        <span class="muted small">checking backend…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- Read-only view of the effective model config; toggled from the status
+         strip. Filled from /health.provider — never written back. -->
+    <section id="provider-panel" class="provider-panel" aria-label="Model configuration" hidden></section>
+
+    <!-- Scan bar -->
+    <form id="scan-form" class="scanbar" autocomplete="off">
+      <div class="field grow">
+        <label for="target-dir">Folder to organise</label>
+        <input type="text" id="target-dir" name="target_dir" class="mono"
+               placeholder="/Users/you/Downloads" spellcheck="false" required>
+      </div>
+      <div class="field narrow">
+        <label for="max-delegations">Max file calls</label>
+        <input type="number" id="max-delegations" name="max_delegations"
+               min="0" step="1" placeholder="no cap">
+      </div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <button type="submit" id="scan-btn" class="btn btn-primary">Dry run</button>
+      </div>
+
+      <!-- Opt-in: skip the rule table and delegate every file. The hint below
+           is filled from /health + the last plan for this folder — it is the
+           only place the cost of that choice is stated before it is made. -->
+      <div id="scan-option" class="scanopt">
+        <label class="scanopt-head" for="skip-rules">
+          <input type="checkbox" id="skip-rules" name="skip_rules">
+          <span class="scanopt-text">
+            <span class="scanopt-title">
+              Let the agents classify every file
+              <span class="badge badge-agent">skips the rule table</span>
+            </span>
+            <span class="scanopt-why">
+              The rule table groups by file <em>type</em> — a folder of 40 PDFs becomes one
+              undifferentiated <code>Documents/</code>. The agents group by what each file is
+              <em>about</em>: <code>Tenancy</code>, <code>Lecture Notes</code>. Much better grouping,
+              at one model call per <em>file</em> instead of only the leftovers.
+            </span>
+          </span>
+        </label>
+        <div id="scan-option-hint" class="scanopt-hint" aria-live="polite"></div>
+      </div>
+
+      <p class="scanbar-note">
+        A dry run only <em>reads</em> the folder and writes a plan.
+        <strong>Nothing moves</strong> until you approve items and press Apply.
+        <span class="kbd-hint"><kbd>Enter</kbd> to scan · <kbd>/</kbd> focus path · <kbd>a</kbd> toggle all</span>
+      </p>
+    </form>
+
+    <!-- Rules → Scheme → Assignments; filled from /health + plan + scan progress -->
+    <section id="pipeline" class="pipeline-wrap" aria-label="Pipeline status"></section>
+
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button type="button" class="tab active" id="tab-plan" role="tab"
+              aria-selected="true" aria-controls="plan-view" data-tab="plan">Plan</button>
+      <button type="button" class="tab" id="tab-history" role="tab"
+              aria-selected="false" aria-controls="history-view" data-tab="history">History</button>
+    </nav>
+
+    <div id="banner" class="banner" role="status" hidden></div>
+
+    <section id="plan-view" class="view" role="tabpanel" aria-labelledby="tab-plan"></section>
+    <section id="history-view" class="view" role="tabpanel" aria-labelledby="tab-history" hidden></section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
