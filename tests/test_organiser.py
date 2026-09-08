@@ -1108,5 +1108,367 @@ class ManagerRespectsTheAllowlistTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.outside.iterdir()], ["photo.jpg"])
 
 
+class NoOpinionTests(unittest.TestCase):
+    """A delegate that is working but unsure must be able to say so.
+
+    Before `category=None` existed, the only way to leave a file alone was to
+    raise — which the manager records as the delegate having errored. So an
+    honest "I don't know" was indistinguishable from a fault, and the only
+    alternative was to name a category anyway.
+    """
+
+    def setUp(self):
+        self.root = build_sandbox()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def _manager_with(self, decision):
+        class Undecided:
+            name = "undecided"
+
+            def available(self):
+                return True, "fine"
+
+            def decide(self, request):
+                return decision
+
+        register_stubs(classifier=Undecided())
+        return Manager(delegate_name="undecided", scheme_name="scheme-stub")
+
+    def test_a_none_category_leaves_the_file_alone(self):
+        plan = self._manager_with(
+            DelegateDecision(
+                category=None,
+                confidence="n/a",
+                reason="genuinely unsure",
+                decided_by="undecided",
+            )
+        ).scan(str(self.root), use_rules=False)
+        self.assertEqual(plan.moves, [])
+        self.assertTrue(plan.skips)
+
+    def test_the_delegates_own_words_survive(self):
+        plan = self._manager_with(
+            DelegateDecision(
+                category=None,
+                confidence="n/a",
+                reason="genuinely unsure",
+                decided_by="undecided",
+            )
+        ).scan(str(self.root), use_rules=False)
+        self.assertTrue(any("genuinely unsure" in i.reason for i in plan.skips))
+
+    def test_no_opinion_is_not_recorded_as_an_error(self):
+        """The distinction the whole change exists for."""
+        plan = self._manager_with(
+            DelegateDecision(
+                category=None,
+                confidence="n/a",
+                reason="genuinely unsure",
+                decided_by="undecided",
+            )
+        ).scan(str(self.root), use_rules=False)
+        for item in plan.skips:
+            self.assertNotIn("errored", item.reason)
+
+    def test_no_opinion_never_becomes_the_fallback_category(self):
+        """The failure this replaces: filing an unknown into Other/ is a guess
+        wearing a different hat, and it still moves the file."""
+        plan = self._manager_with(
+            DelegateDecision(
+                category=None,
+                confidence="n/a",
+                reason="genuinely unsure",
+                decided_by="undecided",
+            )
+        ).scan(str(self.root), use_rules=False)
+        self.assertNotIn(FALLBACK_CATEGORY, [i.category for i in plan.items])
+
+
+class McpServerTests(unittest.TestCase):
+    """The MCP surface. Exercised through the tool functions directly, which
+    is where the behaviour is — the transport is FastMCP's problem."""
+
+    def setUp(self):
+        from organiser import mcp_server
+
+        self.mcp_server = mcp_server
+        self.root = build_sandbox()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def _call(self, tool, **kwargs):
+        # FastMCP 4's @mcp.tool registers the tool and hands back the ORIGINAL
+        # function, so the tools stay ordinary Python callables and the
+        # behaviour can be tested without standing up a transport.
+        return tool(**kwargs)
+
+    def _annotations(self, name: str):
+        """Annotations as the CLIENT would see them — read off the registry,
+        not off the source. Asserting against the decorator argument would
+        only prove I typed it twice."""
+        import asyncio
+
+        tools = asyncio.run(self.mcp_server.mcp.list_tools())
+        return next(t for t in tools if t.name == name).annotations
+
+    def test_scan_directory_moves_nothing(self):
+        before = sorted(p.name for p in self.root.iterdir())
+        self._call(self.mcp_server.scan_directory, path=str(self.root))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
+
+    def test_scan_directory_separates_decided_from_undecided(self):
+        result = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        self.assertIn("decided_by_rules", result)
+        self.assertIn("needs_judgement", result)
+        self.assertEqual(
+            result["counts"]["decided_by_rules"], len(result["decided_by_rules"])
+        )
+
+    def test_snippets_are_off_unless_asked_for(self):
+        """Contents are the document, not metadata. Sending them to a model
+        should be somebody's decision, not a default."""
+        result = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        for item in result["needs_judgement"]:
+            self.assertNotIn("snippet", item)
+        opted_in = self._call(
+            self.mcp_server.scan_directory, path=str(self.root), include_snippets=True
+        )
+        if opted_in["needs_judgement"]:
+            self.assertIn("snippet", opted_in["needs_judgement"][0])
+
+    def test_a_folder_outside_the_allowlist_is_refused(self):
+        from fastmcp.exceptions import ToolError
+
+        outside = Path(tempfile.mkdtemp(prefix="organiser-mcp-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        original = os.environ["FILE_ORGANISER_ALLOWED_ROOTS"]
+        os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = str(self.root)
+        try:
+            with self.assertRaises(ToolError):
+                self._call(self.mcp_server.scan_directory, path=str(outside))
+        finally:
+            os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = original
+
+    def test_the_refusal_says_what_is_allowed(self):
+        from fastmcp.exceptions import ToolError
+
+        outside = Path(tempfile.mkdtemp(prefix="organiser-mcp-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        original = os.environ["FILE_ORGANISER_ALLOWED_ROOTS"]
+        os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = str(self.root)
+        try:
+            with self.assertRaises(ToolError) as ctx:
+                self._call(self.mcp_server.scan_directory, path=str(outside))
+            self.assertIn(str(self.root), str(ctx.exception))
+        finally:
+            os.environ["FILE_ORGANISER_ALLOWED_ROOTS"] = original
+
+    def test_host_assignments_decide_without_any_provider(self):
+        """The point of the whole seam: judgement arrives from the host model
+        and the manager cannot tell the difference. No API key involved."""
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        self.assertTrue(names, "sandbox should contain files the rules can't place")
+        result = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={names[0]: "Host Chosen"},
+            use_rules=False,
+        )
+        moved = {m["name"]: m["category"] for m in result["moves"]}
+        self.assertEqual(moved.get(names[0]), "Host Chosen")
+
+    def test_propose_plan_moves_nothing(self):
+        before = sorted(p.name for p in self.root.iterdir())
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={names[0]: "Host Chosen"},
+        )
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
+
+    def test_files_the_host_did_not_assign_stay_put(self):
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        self.assertGreater(len(names), 1, "need at least two undecided files")
+        result = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={names[0]: "Host Chosen"},
+            use_rules=False,
+        )
+        staying = [s["name"] for s in result["staying_put"]]
+        self.assertIn(names[1], staying)
+
+    def test_assignments_are_authoritative_by_default(self):
+        """The rule pass runs before any delegate, so leaving it on would mean
+        a file the rules recognise never reaches the host's decision. Asking
+        for notes.txt -> Meetings must not quietly produce Documents/."""
+        (self.root / "meeting notes.txt").write_text("agenda")
+        result = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={"meeting notes.txt": "Meetings"},
+        )
+        moved = {m["name"]: m["category"] for m in result["moves"]}
+        self.assertEqual(moved.get("meeting notes.txt"), "Meetings")
+        self.assertFalse(result["used_rules"])
+
+    def test_an_overruled_assignment_is_reported_not_dropped(self):
+        """With the rules deliberately switched on they win — but never
+        silently."""
+        (self.root / "meeting notes.txt").write_text("agenda")
+        result = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={"meeting notes.txt": "Meetings"},
+            use_rules=True,
+        )
+        overruled = {o["name"]: o for o in result["overruled_by_rules"]}
+        self.assertIn("meeting notes.txt", overruled)
+        self.assertEqual(overruled["meeting notes.txt"]["wanted"], "Meetings")
+        self.assertEqual(overruled["meeting notes.txt"]["got"], "Documents")
+
+    def test_assigning_a_file_that_is_not_there_is_reported(self):
+        result = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={"ghost.txt": "Nowhere"},
+        )
+        self.assertIn(
+            "ghost.txt", [o["name"] for o in result["overruled_by_rules"]]
+        )
+
+    def test_a_bad_assignments_shape_is_refused(self):
+        from fastmcp.exceptions import ToolError
+
+        with self.assertRaises(ToolError):
+            self._call(
+                self.mcp_server.propose_plan,
+                path=str(self.root),
+                assignments={"a.txt": 42},
+            )
+
+    def test_first_apply_to_a_folder_needs_confirmation(self):
+        from fastmcp.exceptions import ToolError
+
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        plan = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={names[0]: "Host Chosen"},
+        )
+        with self.assertRaises(ToolError) as ctx:
+            self._call(self.mcp_server.apply_plan, plan_id=plan["plan_id"])
+        self.assertIn("confirm", str(ctx.exception).lower())
+
+    def _files_under(self, root: Path) -> list[str]:
+        """Every file, by name, wherever it currently sits."""
+        return sorted(p.name for p in root.rglob("*") if p.is_file())
+
+    def test_apply_then_undo_returns_every_file(self):
+        before = self._files_under(self.root)
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        plan = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={n: "Host Chosen" for n in names},
+        )
+        applied = self._call(
+            self.mcp_server.apply_plan, plan_id=plan["plan_id"], confirm=True
+        )
+        self.assertTrue(applied["moved"])
+        self._call(self.mcp_server.undo_plan, plan_id=plan["plan_id"], confirm=True)
+        self.assertEqual(self._files_under(self.root), before)
+
+    def test_every_file_is_back_at_its_original_path(self):
+        """Same names in the tree isn't enough — they have to be back in the
+        same places."""
+        before = sorted(str(p) for p in self.root.rglob("*") if p.is_file())
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        plan = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={n: "Host Chosen" for n in names},
+        )
+        self._call(self.mcp_server.apply_plan, plan_id=plan["plan_id"], confirm=True)
+        self._call(self.mcp_server.undo_plan, plan_id=plan["plan_id"], confirm=True)
+        self.assertEqual(
+            sorted(str(p) for p in self.root.rglob("*") if p.is_file()), before
+        )
+
+    def test_undo_leaves_the_empty_category_folders_behind(self):
+        """Deliberate, and a direct consequence of never deleting anything.
+
+        Undo restores files; it does not remove the folders that were created
+        to hold them, because removing a directory is a delete and there is no
+        delete in this codebase. Empty folders are litter, not damage — and
+        the alternative is code that removes directories, which is exactly the
+        capability worth not having.
+        """
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        plan = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={n: "Host Chosen" for n in names},
+        )
+        self._call(self.mcp_server.apply_plan, plan_id=plan["plan_id"], confirm=True)
+        self._call(self.mcp_server.undo_plan, plan_id=plan["plan_id"], confirm=True)
+        leftover = self.root / "Host Chosen"
+        self.assertTrue(leftover.is_dir())
+        self.assertEqual(list(leftover.iterdir()), [])
+
+    def test_undo_without_confirm_is_a_dry_run(self):
+        scan = self._call(self.mcp_server.scan_directory, path=str(self.root))
+        names = [f["name"] for f in scan["needs_judgement"]]
+        plan = self._call(
+            self.mcp_server.propose_plan,
+            path=str(self.root),
+            assignments={n: "Host Chosen" for n in names},
+        )
+        self._call(self.mcp_server.apply_plan, plan_id=plan["plan_id"], confirm=True)
+        after_apply = sorted(p.name for p in self.root.iterdir())
+        preview = self._call(self.mcp_server.undo_plan, plan_id=plan["plan_id"])
+        self.assertTrue(preview["dry_run"])
+        self.assertGreater(preview["would_reverse"], 0)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), after_apply)
+
+    def test_the_read_only_tools_are_declared_read_only(self):
+        """MCP annotations are how a client knows which calls are safe to make
+        without asking. Getting them wrong is worse than omitting them."""
+        self.assertTrue(self._annotations("scan_directory").read_only_hint)
+        self.assertTrue(self._annotations("list_allowed_roots").read_only_hint)
+        self.assertTrue(self._annotations("propose_plan").read_only_hint)
+        self.assertFalse(self._annotations("apply_plan").read_only_hint)
+
+    def test_nothing_is_advertised_as_destructive_because_nothing_is(self):
+        """Move-only, logged and reversible. If any tool here ever needs
+        destructive_hint=True, something has gone badly wrong upstream."""
+        for name in ("scan_directory", "propose_plan", "apply_plan", "undo_plan"):
+            self.assertFalse(
+                self._annotations(name).destructive_hint, f"{name} claims to destroy"
+            )
+
+    def test_every_tool_is_registered(self):
+        import asyncio
+
+        registered = {t.name for t in asyncio.run(self.mcp_server.mcp.list_tools())}
+        self.assertEqual(
+            registered,
+            {
+                "list_allowed_roots",
+                "scan_directory",
+                "propose_plan",
+                "apply_plan",
+                "undo_plan",
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
